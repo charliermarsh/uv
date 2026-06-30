@@ -523,27 +523,28 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                     let cache_selected_version = url.is_none() && index.is_none();
                     let reusable_version = if cache_selected_version
                         && let Some((selected_range, version)) =
-                            state.selected_versions.get(&next_id)
+                            state.selected_versions.get(&next_id).cloned()
                     {
-                        let can_reuse = selected_range == range
+                        let can_reuse = selected_range == *range
                             || if let Some(name) = next_package.name() {
-                                range.contains(version)
+                                range.contains(&version)
                                     && preferences.get(name).is_empty()
                                     && (self.exclusions.reinstall(name)
                                         || self.installed_packages.get_packages(name).is_empty())
                                     && self.all_better_versions_conflict(
                                         name,
                                         range,
-                                        version,
+                                        &version,
                                         next_id,
                                         &state.pubgrub,
                                         &state.env,
                                         &state.python_requirement,
+                                        &mut state.better_candidates,
                                     )?
                             } else {
                                 false
                             };
-                        can_reuse.then(|| version.clone())
+                        can_reuse.then_some(version)
                     } else {
                         None
                     };
@@ -1491,6 +1492,7 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         pubgrub: &State<UvDependencyProvider>,
         env: &ResolverEnvironment,
         python_requirement: &PythonRequirement,
+        better_candidates: &mut FxHashMap<Id<PubGrubPackage>, BetterCandidateCache>,
     ) -> Result<bool, ResolveError> {
         let versions_response = self
             .index
@@ -1507,6 +1509,27 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
         } else {
             range.intersection(&Range::strictly_lower_than(selected.clone()))
         };
+
+        // PubGrub reasons over mathematical version ranges, while package indexes expose a finite
+        // set of actual versions. Remember the viable registry candidates we already inspected so
+        // a later revisit in the same fork can prove that finite set conflicts without selecting
+        // every candidate again.
+        if let Some(cache) = better_candidates.get(&package)
+            && remaining.subset_of(&cache.checked)
+        {
+            let viable = remaining.intersection(&cache.viable);
+            if viable == Range::empty()
+                || pubgrub.range_conflicts_with_partial_solution(package, viable)
+            {
+                return Ok(true);
+            }
+        }
+
+        if pubgrub.range_conflicts_with_partial_solution(package, remaining.clone()) {
+            return Ok(true);
+        }
+        let checked = remaining.clone();
+        let mut viable = Range::empty();
         while let Some(candidate) =
             self.selector
                 .select_no_preference(name, &remaining, version_maps, env)
@@ -1514,9 +1537,11 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
             let version = candidate.version().clone();
             if let CandidateDist::Compatible(dist) = candidate.dist()
                 && Self::check_requires_python(dist, python_requirement).is_none()
-                && !pubgrub.version_conflicts_with_partial_solution(package, version.clone())
             {
-                return Ok(false);
+                viable = viable.union(&Range::singleton(version.clone()));
+                if !pubgrub.version_conflicts_with_partial_solution(package, version.clone()) {
+                    return Ok(false);
+                }
             }
             remaining = if highest {
                 remaining.intersection(&Range::strictly_lower_than(version))
@@ -1524,6 +1549,13 @@ impl<InstalledPackages: InstalledPackagesProvider> ResolverState<InstalledPackag
                 remaining.intersection(&Range::strictly_higher_than(version))
             };
         }
+        better_candidates
+            .entry(package)
+            .and_modify(|cache| {
+                cache.checked = cache.checked.union(&checked);
+                cache.viable = cache.viable.union(&viable);
+            })
+            .or_insert(BetterCandidateCache { checked, viable });
         Ok(true)
     }
 
@@ -3048,6 +3080,11 @@ pub(crate) struct ForkState {
     pre_visited: FxHashMap<Id<PubGrubPackage>, Range<Version>>,
     /// The last version selected for each package and range in a specific environment.
     selected_versions: FxHashMap<Id<PubGrubPackage>, (Range<Version>, Version)>,
+    /// Viable registry candidates already checked while proving a saved version remains maximal.
+    ///
+    /// This is scoped to one fork because candidate viability depends on its markers and Python
+    /// requirement.
+    better_candidates: FxHashMap<Id<PubGrubPackage>, BetterCandidateCache>,
     /// The marker expression that created this state.
     ///
     /// The root state always corresponds to a marker expression that is always
@@ -3102,6 +3139,7 @@ impl ForkState {
             added_dependencies: FxHashMap::default(),
             pre_visited: FxHashMap::default(),
             selected_versions: FxHashMap::default(),
+            better_candidates: FxHashMap::default(),
             env,
             python_requirement,
             conflict_tracker: ConflictTracker::default(),
@@ -3358,6 +3396,7 @@ impl ForkState {
     /// If the fork should be dropped (e.g., because its markers can never be true for its
     /// Python requirement), then this returns `None`.
     fn with_env(mut self, env: ResolverEnvironment) -> Self {
+        self.better_candidates.clear();
         self.env = env;
         // If the fork contains a narrowed Python requirement, apply it.
         if let Some(req) = self.env.narrow_python_requirement(&self.python_requirement) {
@@ -3641,6 +3680,14 @@ impl ForkState {
             env: self.env,
         }
     }
+}
+
+#[derive(Clone)]
+struct BetterCandidateCache {
+    /// Mathematical ranges for which every actual registry candidate was inspected.
+    checked: Range<Version>,
+    /// Compatible candidates within checked; unavailable candidates are intentionally omitted.
+    viable: Range<Version>,
 }
 
 /// The resolution from a single fork including the virtual packages and the edges between them.
